@@ -10,7 +10,7 @@ const _app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[
 const _db  = getDatabase(_app)
 
 const FB_PATH     = '/ecu/live'
-const HISTORY_LEN = 120   // simpan 120 titik (lebih banyak untuk riwayat panjang)
+const HISTORY_LEN = 120
 
 const C = {
   rpm: '#0077ff',
@@ -24,14 +24,12 @@ const C = {
 
 // ════════════════════════════════════════════════════════════
 //  HOOK DATA HISTORIS REAL-TIME
-//  FIX: gunakan useRef untuk buffer history — tidak trigger
-//       re-render setiap tick, state hanya di-update berkala
 // ════════════════════════════════════════════════════════════
 function useHistory() {
-  // Buffer ref: tidak memicu re-render
-  const bufRef = useRef({ rpm: [], bat: [], eot: [], iat: [], afr: [], timestamps: [] })
+  const bufRef = useRef({
+    rpm: [], bat: [], eot: [], iat: [], afr: [], timestamps: []
+  })
 
-  // State yang benar-benar di-render — di-update tiap N detik
   const [hist,      setHist]      = useState({ rpm: [], bat: [], eot: [], iat: [], afr: [], timestamps: [] })
   const [connected, setConnected] = useState(false)
   const [lastVal,   setLastVal]   = useState(null)
@@ -39,10 +37,16 @@ function useHistory() {
   useEffect(() => {
     const liveRef = ref(_db, FB_PATH)
 
-    // Timer flush: salin buffer ke state setiap 1 detik
-    // Ini mencegah setState dipanggil setiap data masuk (bisa ratusan kali/menit)
     const flushTimer = setInterval(() => {
-      setHist({ ...bufRef.current })
+      const b = bufRef.current
+      setHist({
+        rpm:        [...b.rpm],
+        bat:        [...b.bat],
+        eot:        [...b.eot],
+        iat:        [...b.iat],
+        afr:        [...b.afr],
+        timestamps: [...b.timestamps],
+      })
     }, 1000)
 
     const unsub = onValue(
@@ -61,7 +65,6 @@ function useHistory() {
           afr: Number(d.afr ?? 14.7),
         }
 
-        // Tulis ke buffer (ref) — tanpa setState
         const b    = bufRef.current
         const push = (arr, v) => { arr.push(v); if (arr.length > HISTORY_LEN) arr.shift() }
         push(b.rpm,        point.rpm)
@@ -71,7 +74,6 @@ function useHistory() {
         push(b.afr,        point.afr)
         push(b.timestamps, now)
 
-        // lastVal dan connected boleh setState langsung — perubahan kecil
         setConnected(true)
         setLastVal(point)
       },
@@ -85,33 +87,46 @@ function useHistory() {
       unsub()
       clearInterval(flushTimer)
     }
-  }, [])  // <-- dependency array KOSONG: hanya mount/unmount
+  }, [])
 
   return { hist, connected, lastVal }
 }
 
 // ════════════════════════════════════════════════════════════
-//  CANVAS CHART RENDERER
-//  FIX: dependency array [datasets, showRefLines] — hanya
-//       redraw ketika data atau toggle benar-benar berubah
+//  CANVAS CHART RENDERER — dengan label sumbu X dan Y
 // ════════════════════════════════════════════════════════════
-function SensorChart({ label, datasets, height = 160, showRefLines }) {
-  const canvasRef = useRef(null)
+function SensorChart({ label, datasets, height = 180, showRefLines, timestamps, yAxisConfig }) {
+  const canvasRef    = useRef(null)
+  const pendingRaf   = useRef(null)
 
-  // draw function dibungkus useCallback agar stabil
   const draw = useCallback(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')
     const dpr = window.devicePixelRatio || 1
-    const W   = canvas.offsetWidth
-    if (W === 0) return          // belum mount
-    const H   = height
 
-    canvas.width  = W * dpr
-    canvas.height = H * dpr
-    ctx.scale(dpr, dpr)
+    const container = canvas.parentElement
+    const W = container ? container.clientWidth : canvas.offsetWidth
+    if (W === 0) return
+    const H = height
+
+    const targetW = Math.round(W * dpr)
+    const targetH = Math.round(H * dpr)
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width  = targetW
+      canvas.height = targetH
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, W, H)
+
+    // ── Margin untuk label sumbu ──────────────────────────
+    const PAD_L  = 46   // ruang Y-axis label kiri
+    const PAD_R  = 8
+    const PAD_T  = 8
+    const PAD_B  = 28   // ruang X-axis label bawah
+    const chartW = W - PAD_L - PAD_R
+    const chartH = H - PAD_T - PAD_B
 
     if (!datasets || datasets.every(d => d.data.length < 2)) {
       ctx.fillStyle = 'rgba(0,50,120,0.35)'
@@ -121,22 +136,88 @@ function SensorChart({ label, datasets, height = 160, showRefLines }) {
       return
     }
 
-    // Grid horizontal
-    ctx.strokeStyle = 'rgba(0,85,204,0.12)'
-    ctx.lineWidth   = 0.5
-    for (let i = 0; i <= 4; i++) {
-      const y = (H - 12) * (i / 4) + 6
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke()
+    // Tentukan range Y dari dataset pertama (atau pakai yAxisConfig)
+    const primary  = datasets[0]
+    const yMin     = yAxisConfig ? yAxisConfig.min : primary.min
+    const yMax     = yAxisConfig ? yAxisConfig.max : primary.max
+    const yLabel   = yAxisConfig ? yAxisConfig.label : null
+    const yFormat  = yAxisConfig ? yAxisConfig.format : (v => v % 1 === 0 ? v : v.toFixed(1))
+    const ySpan    = yMax - yMin || 1
+
+    // ── Gambar grid horizontal + label Y-axis ─────────────
+    const Y_STEPS = 4
+    ctx.font      = `${Math.round(8 * dpr) / dpr}px monospace`
+    ctx.textAlign = 'right'
+
+    for (let i = 0; i <= Y_STEPS; i++) {
+      const frac = i / Y_STEPS
+      const yPx  = PAD_T + chartH * (1 - frac)
+      const yVal = yMin + frac * ySpan
+
+      // Grid line
+      ctx.strokeStyle = 'rgba(0,85,204,0.1)'
+      ctx.lineWidth   = 0.5
+      ctx.setLineDash([])
+      ctx.beginPath()
+      ctx.moveTo(PAD_L, yPx)
+      ctx.lineTo(PAD_L + chartW, yPx)
+      ctx.stroke()
+
+      // Label Y
+      ctx.fillStyle = 'rgba(0,50,120,0.45)'
+      ctx.fillText(yFormat(yVal), PAD_L - 4, yPx + 3.5)
     }
 
-    datasets.forEach(({ data, color, min, max, refLines }) => {
-      if (data.length < 2) return
-      const span = max - min || 1
-      const N    = data.length
-      const step = W / (N - 1)
-      const yOf  = v => H - 12 - ((Math.min(max, Math.max(min, v)) - min) / span) * (H - 18)
+    // Label satuan Y di pojok kiri atas
+    if (yLabel) {
+      ctx.save()
+      ctx.font      = '8px monospace'
+      ctx.fillStyle = 'rgba(0,50,120,0.35)'
+      ctx.textAlign = 'left'
+      ctx.fillText(yLabel, 0, PAD_T + 7)
+      ctx.restore()
+    }
 
-      // Garis referensi
+    // ── Gambar label X-axis (timestamps) ─────────────────
+    if (timestamps && timestamps.length >= 2) {
+      const N = timestamps.length
+      // Tampilkan 4–5 label X agar tidak terlalu padat
+      const xStepCount = Math.min(4, N - 1)
+      ctx.font      = '8px monospace'
+      ctx.fillStyle = 'rgba(0,50,120,0.40)'
+
+      for (let i = 0; i <= xStepCount; i++) {
+        const idx  = Math.round((i / xStepCount) * (N - 1))
+        const xPx  = PAD_L + (idx / (N - 1)) * chartW
+        const ts   = timestamps[idx]
+        // Ambil hanya jam:menit:detik, persingkat jadi mm:ss saja agar muat
+        const parts = ts ? ts.split(':') : []
+        const label = parts.length >= 3 ? `${parts[1]}:${parts[2]}` : ts || ''
+
+        ctx.textAlign = i === 0 ? 'left' : i === xStepCount ? 'right' : 'center'
+        ctx.fillText(label, xPx, H - 6)
+
+        // Tick mark kecil
+        ctx.strokeStyle = 'rgba(0,85,204,0.15)'
+        ctx.lineWidth   = 0.6
+        ctx.beginPath()
+        ctx.moveTo(xPx, PAD_T + chartH)
+        ctx.lineTo(xPx, PAD_T + chartH + 4)
+        ctx.stroke()
+      }
+    }
+
+    // ── Render setiap dataset ─────────────────────────────
+    datasets.forEach(({ data, color, min: dMin, max: dMax, refLines }, dsIdx) => {
+      if (data.length < 2) return
+
+      // Dataset ke-2 dst pakai skala normalnya sendiri (sudah di-remap sebelum dikirim)
+      // tapi kita render di area yang sama menggunakan yMin/yMax chart
+      const span  = ySpan
+      const N     = data.length
+      const step  = chartW / (N - 1)
+      const yOf   = v => PAD_T + chartH - ((Math.min(yMax, Math.max(yMin, v)) - yMin) / span) * chartH
+
       if (refLines && showRefLines) {
         refLines.forEach(({ val, color: rc, dash }) => {
           const y = yOf(val)
@@ -144,57 +225,94 @@ function SensorChart({ label, datasets, height = 160, showRefLines }) {
           ctx.strokeStyle = rc || 'rgba(0,85,204,0.2)'
           ctx.lineWidth   = 0.8
           ctx.setLineDash(dash || [])
-          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke()
+          ctx.beginPath()
+          ctx.moveTo(PAD_L, y)
+          ctx.lineTo(PAD_L + chartW, y)
+          ctx.stroke()
           ctx.restore()
         })
       }
 
-      // Fill gradien
-      const grad = ctx.createLinearGradient(0, 0, 0, H)
+      const grad = ctx.createLinearGradient(0, PAD_T, 0, PAD_T + chartH)
       grad.addColorStop(0, color + '30')
       grad.addColorStop(1, 'transparent')
       ctx.beginPath()
       data.forEach((v, i) => {
-        const x = i * step, y = yOf(v)
+        const x = PAD_L + i * step
+        const y = yOf(v)
         i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
       })
-      ctx.lineTo((N - 1) * step, H)
-      ctx.lineTo(0, H)
+      ctx.lineTo(PAD_L + (N - 1) * step, PAD_T + chartH)
+      ctx.lineTo(PAD_L, PAD_T + chartH)
       ctx.closePath()
       ctx.fillStyle = grad
       ctx.fill()
 
-      // Garis utama
       ctx.beginPath()
       ctx.strokeStyle = color
       ctx.lineWidth   = 1.8
       ctx.lineJoin    = 'round'
       ctx.lineCap     = 'round'
+      ctx.setLineDash([])
       data.forEach((v, i) => {
-        const x = i * step, y = yOf(v)
+        const x = PAD_L + i * step
+        const y = yOf(v)
         i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
       })
       ctx.stroke()
 
-      // Titik terakhir
+      // Titik terkini + nilai terkini di ujung garis
+      const lastX = PAD_L + (N - 1) * step
+      const lastY = yOf(data[N - 1])
       ctx.beginPath()
-      ctx.arc((N - 1) * step, yOf(data[N - 1]), 3.5, 0, Math.PI * 2)
+      ctx.arc(lastX, lastY, 3.5, 0, Math.PI * 2)
       ctx.fillStyle = color
       ctx.fill()
+
+      // Label nilai terkini di ujung (hanya untuk dataset utama / dsIdx===0)
+      if (dsIdx === 0 && yAxisConfig && yAxisConfig.showLiveLabel !== false) {
+        const liveVal  = data[N - 1]
+        const liveText = yFormat(liveVal)
+        ctx.save()
+        ctx.font      = 'bold 9px monospace'
+        ctx.fillStyle = color
+        ctx.textAlign = lastX > PAD_L + chartW - 30 ? 'right' : 'left'
+        const lx = lastX > PAD_L + chartW - 30 ? lastX - 6 : lastX + 6
+        const ly = lastY < PAD_T + 14 ? lastY + 13 : lastY - 5
+        ctx.fillText(liveText, lx, ly)
+        ctx.restore()
+      }
     })
-  }, [datasets, height, showRefLines])
 
-  // Jalankan draw hanya ketika data atau toggle berubah
-  useEffect(() => { draw() }, [draw])
+    // ── Border kanan sumbu Y ──────────────────────────────
+    ctx.strokeStyle = 'rgba(0,85,204,0.15)'
+    ctx.lineWidth   = 0.8
+    ctx.setLineDash([])
+    ctx.beginPath()
+    ctx.moveTo(PAD_L, PAD_T)
+    ctx.lineTo(PAD_L, PAD_T + chartH)
+    ctx.stroke()
 
-  // Resize observer — redraw jika lebar kontainer berubah
+  }, [datasets, height, showRefLines, timestamps, yAxisConfig])
+
+  const scheduleDraw = useCallback(() => {
+    cancelAnimationFrame(pendingRaf.current)
+    pendingRaf.current = requestAnimationFrame(draw)
+  }, [draw])
+
+  useEffect(() => {
+    scheduleDraw()
+    return () => cancelAnimationFrame(pendingRaf.current)
+  }, [scheduleDraw])
+
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !window.ResizeObserver) return
-    const ro = new ResizeObserver(() => draw())
-    ro.observe(canvas)
+    const target = canvas.parentElement || canvas
+    const ro = new ResizeObserver(() => scheduleDraw())
+    ro.observe(target)
     return () => ro.disconnect()
-  }, [draw])
+  }, [scheduleDraw])
 
   return (
     <canvas
@@ -205,20 +323,131 @@ function SensorChart({ label, datasets, height = 160, showRefLines }) {
 }
 
 // ════════════════════════════════════════════════════════════
+//  KOMPONEN PANEL HISTORI
+// ════════════════════════════════════════════════════════════
+function HistoryPanel({ columns, timestamps }) {
+  const n = timestamps.length
+  if (n === 0) return (
+    <div style={{
+      fontSize: '10px', color: 'rgba(0,50,120,0.35)', fontStyle: 'italic',
+      textAlign: 'center', padding: '8px 0'
+    }}>
+      Belum ada data histori
+    </div>
+  )
+
+  const gridCols = `50px ${columns.map(() => '1fr').join(' ')}`
+
+  return (
+    <div style={{
+      borderTop: '1px solid rgba(0,85,204,0.1)',
+      paddingTop: '8px',
+      marginTop: '6px',
+    }}>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: gridCols,
+        gap: '4px',
+        marginBottom: '4px',
+        paddingBottom: '4px',
+        borderBottom: '1px solid rgba(0,85,204,0.08)',
+      }}>
+        <span style={{ fontSize: '9px', fontWeight: 800, color: 'rgba(0,50,120,0.4)', letterSpacing: '0.8px', textTransform: 'uppercase' }}>
+          Waktu
+        </span>
+        {columns.map((col) => (
+          <span key={col.label} style={{
+            fontSize: '9px', fontWeight: 800, letterSpacing: '0.8px',
+            color: col.color, textTransform: 'uppercase', textAlign: 'right'
+          }}>
+            {col.label}
+          </span>
+        ))}
+      </div>
+
+      <div style={{
+        maxHeight: '96px',
+        overflowY: 'auto',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '1px',
+        scrollbarWidth: 'thin',
+        scrollbarColor: 'rgba(0,119,255,0.2) transparent',
+      }}>
+        {Array.from({ length: n }, (_, i) => n - 1 - i).map((idx) => {
+          const isLatest = idx === n - 1
+          const hasAlert = columns.some(col => col.isAlert && col.isAlert(col.values[idx]))
+
+          return (
+            <div
+              key={idx}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: gridCols,
+                gap: '4px',
+                padding: '3px 4px',
+                borderRadius: '4px',
+                background: isLatest
+                  ? 'rgba(0,119,255,0.06)'
+                  : hasAlert
+                  ? 'rgba(217,38,61,0.04)'
+                  : 'transparent',
+                transition: 'background 0.2s',
+              }}
+            >
+              <span style={{
+                fontSize: '10px',
+                color: isLatest ? 'rgba(0,50,120,0.7)' : 'rgba(0,50,120,0.4)',
+                fontVariantNumeric: 'tabular-nums',
+                fontWeight: isLatest ? 700 : 400,
+              }}>
+                {timestamps[idx]}
+              </span>
+              {columns.map((col) => {
+                const val   = col.values[idx]
+                const alert = col.isAlert && col.isAlert(val)
+                return (
+                  <span
+                    key={col.label}
+                    style={{
+                      fontSize: '10px',
+                      fontWeight: 700,
+                      textAlign: 'right',
+                      fontVariantNumeric: 'tabular-nums',
+                      color: alert ? C.red : col.color,
+                      opacity: isLatest ? 1 : 0.7,
+                    }}
+                  >
+                    {col.format ? col.format(val) : val}
+                    {col.unit || ''}
+                    {alert ? ' ⚠' : ''}
+                  </span>
+                )
+              })}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ════════════════════════════════════════════════════════════
 //  KOMPONEN CHART CARD
 // ════════════════════════════════════════════════════════════
-function ChartCard({ title, children, badge, badgeColor, delay = 0 }) {
+function ChartCard({ title, children, badge, badgeColor, historyPanel }) {
   return (
     <div style={{
       background: 'rgba(255,255,255,0.92)',
       border: '1.5px solid rgba(0,85,204,0.18)',
       borderRadius: '14px', padding: '12px 14px',
       boxShadow: '0 2px 12px rgba(0,85,204,0.06)',
-      animation: `cardReveal 0.4s cubic-bezier(0.34,1.56,0.64,1) both`,
-      animationDelay: `${delay}s`
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-        <span style={{ fontSize: '10px', fontWeight: 800, letterSpacing: '1.2px', color: 'rgba(0,40,110,0.65)', textTransform: 'uppercase' }}>
+        <span style={{
+          fontSize: '10px', fontWeight: 800, letterSpacing: '1.2px',
+          color: 'rgba(0,40,110,0.65)', textTransform: 'uppercase'
+        }}>
           {title}
         </span>
         {badge && (
@@ -231,6 +460,7 @@ function ChartCard({ title, children, badge, badgeColor, delay = 0 }) {
         )}
       </div>
       {children}
+      {historyPanel}
     </div>
   )
 }
@@ -240,8 +470,8 @@ function ChartCard({ title, children, badge, badgeColor, delay = 0 }) {
 // ════════════════════════════════════════════════════════════
 function analyzeTrend(hist) {
   if (!hist.afr.length) return []
-  const n      = hist.afr.length
-  const avg    = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+  const n       = hist.afr.length
+  const avg     = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
   const results = []
 
   if (n >= 5) {
@@ -280,7 +510,9 @@ function LegendItem({ color, label, value, unit = '' }) {
       <div style={{ width: '12px', height: '2.5px', borderRadius: '2px', background: color, flexShrink: 0 }} />
       <span style={{ fontSize: '10px', color: 'rgba(0,50,120,0.55)', fontWeight: 700, fontStyle: 'italic' }}>
         {label}
-        {value !== undefined && <span style={{ color, marginLeft: '4px', transition: 'color 0.3s' }}>{value}{unit}</span>}
+        {value !== undefined && (
+          <span style={{ color, marginLeft: '4px', transition: 'color 0.3s' }}>{value}{unit}</span>
+        )}
       </span>
     </div>
   )
@@ -303,7 +535,11 @@ function Grafik() {
   }
 
   return (
-    <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden' }}>
+    <div style={{
+      width: '100%', height: '100%',
+      display: 'flex', flexDirection: 'column',
+      position: 'relative', overflow: 'hidden'
+    }}>
       <div className="checker-board"><div className="checker-grid"></div></div>
 
       {/* ── Top Bar ─────────────────────────────────────────── */}
@@ -322,8 +558,10 @@ function Grafik() {
             background: connected ? 'rgba(0,168,90,0.08)' : 'rgba(217,38,61,0.08)',
             border: `1px solid ${connected ? 'rgba(0,168,90,0.25)' : 'rgba(217,38,61,0.25)'}`,
           }}>
-            <span style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '1.5px',
-              color: connected ? C.bat : C.red }}>
+            <span style={{
+              fontSize: '11px', fontWeight: 700, letterSpacing: '1.5px',
+              color: connected ? C.bat : C.red
+            }}>
               {connected ? '● LIVE' : '○ OFFLINE'}
             </span>
             <span style={{ fontSize: '10px', color: 'rgba(0,50,120,0.45)' }}>
@@ -353,7 +591,9 @@ function Grafik() {
             ].map(r => (
               <div key={r.label} style={{ textAlign: 'center' }}>
                 <div style={{ fontSize: '9px', color: 'rgba(0,50,120,0.45)', letterSpacing: '0.8px', fontWeight: 700 }}>{r.label}</div>
-                <div style={{ fontSize: '14px', fontWeight: 900, color: r.color, transition: 'color 0.3s', lineHeight: 1.1 }}>{r.val}{r.unit}</div>
+                <div style={{ fontSize: '14px', fontWeight: 900, color: r.color, transition: 'color 0.3s', lineHeight: 1.1 }}>
+                  {r.val}{r.unit}
+                </div>
               </div>
             ))}
           </div>
@@ -391,16 +631,45 @@ function Grafik() {
             title="RPM vs AFR — Korelasi Akselerasi"
             badge={lastVal ? `${lastVal.rpm.toLocaleString()} rpm` : '—'}
             badgeColor={C.rpm}
-            delay={0}
+            historyPanel={
+              <HistoryPanel
+                timestamps={hist.timestamps}
+                columns={[
+                  {
+                    label: 'RPM',
+                    values: hist.rpm,
+                    color: C.rpm,
+                    format: v => v.toLocaleString(),
+                    unit: '',
+                    isAlert: v => v > 6500,
+                  },
+                  {
+                    label: 'AFR',
+                    values: hist.afr,
+                    color: C.afr,
+                    format: v => v.toFixed(2),
+                    unit: '',
+                    isAlert: v => v > 16 || v < 12,
+                  },
+                ]}
+              />
+            }
           >
             <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '6px' }}>
               <LegendItem color={C.rpm} label="RPM" value={lastVal?.rpm.toLocaleString()} />
-              <LegendItem color={C.afr} label="AFR" value={lastVal?.afr.toFixed(2)} />
+              <LegendItem color={C.afr} label="AFR (ternorm.)" value={lastVal?.afr.toFixed(2)} />
             </div>
             <SensorChart
               label="RPM-AFR"
-              height={160}
+              height={180}
               showRefLines={showRef}
+              timestamps={hist.timestamps}
+              yAxisConfig={{
+                min: 0, max: 8500,
+                label: 'rpm',
+                format: v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : `${v}`,
+                showLiveLabel: true,
+              }}
               datasets={[
                 {
                   data: hist.rpm, color: C.rpm, min: 0, max: 8500,
@@ -426,16 +695,45 @@ function Grafik() {
             title="BAT vs RPM — Monitoring Alternator"
             badge={lastVal ? `${lastVal.bat.toFixed(2)}V` : '—'}
             badgeColor={lastVal && lastVal.bat >= 13.5 ? C.bat : lastVal && lastVal.bat < 12.5 ? C.red : '#e07b00'}
-            delay={0.06}
+            historyPanel={
+              <HistoryPanel
+                timestamps={hist.timestamps}
+                columns={[
+                  {
+                    label: 'BAT',
+                    values: hist.bat,
+                    color: C.bat,
+                    format: v => v.toFixed(2),
+                    unit: 'V',
+                    isAlert: v => v < 12.5,
+                  },
+                  {
+                    label: 'RPM',
+                    values: hist.rpm,
+                    color: C.rpm,
+                    format: v => v.toLocaleString(),
+                    unit: '',
+                    isAlert: v => v > 6500,
+                  },
+                ]}
+              />
+            }
           >
             <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '6px' }}>
               <LegendItem color={C.bat} label="BAT" value={lastVal?.bat.toFixed(2)} unit="V" />
-              <LegendItem color={C.rpm} label="RPM" value={lastVal?.rpm.toLocaleString()} />
+              <LegendItem color={C.rpm} label="RPM (ternorm.)" value={lastVal?.rpm.toLocaleString()} />
             </div>
             <SensorChart
               label="BAT-RPM"
-              height={160}
+              height={180}
               showRefLines={showRef}
+              timestamps={hist.timestamps}
+              yAxisConfig={{
+                min: 10.5, max: 15.5,
+                label: 'Volt',
+                format: v => v.toFixed(1),
+                showLiveLabel: true,
+              }}
               datasets={[
                 {
                   data: hist.bat, color: C.bat, min: 10.5, max: 15.5,
@@ -464,7 +762,29 @@ function Grafik() {
             title="EOT vs IAT — Manajemen Suhu"
             badge={lastVal ? `EOT ${lastVal.eot.toFixed(1)}°C` : '—'}
             badgeColor={lastVal && lastVal.eot > 100 ? C.red : lastVal && lastVal.eot > 85 ? '#e07b00' : C.eot}
-            delay={0.12}
+            historyPanel={
+              <HistoryPanel
+                timestamps={hist.timestamps}
+                columns={[
+                  {
+                    label: 'EOT',
+                    values: hist.eot,
+                    color: C.eot,
+                    format: v => v.toFixed(1),
+                    unit: '°C',
+                    isAlert: v => v > 110,
+                  },
+                  {
+                    label: 'IAT',
+                    values: hist.iat,
+                    color: C.iat,
+                    format: v => v.toFixed(1),
+                    unit: '°C',
+                    isAlert: v => v > 50,
+                  },
+                ]}
+              />
+            }
           >
             <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '6px' }}>
               <LegendItem color={C.eot} label="EOT" value={lastVal?.eot.toFixed(1)} unit="°C" />
@@ -472,8 +792,15 @@ function Grafik() {
             </div>
             <SensorChart
               label="EOT-IAT"
-              height={160}
+              height={180}
               showRefLines={showRef}
+              timestamps={hist.timestamps}
+              yAxisConfig={{
+                min: 30, max: 130,
+                label: '°C',
+                format: v => `${v}°`,
+                showLiveLabel: true,
+              }}
               datasets={[
                 {
                   data: hist.eot, color: C.eot, min: 30, max: 130,
@@ -506,15 +833,44 @@ function Grafik() {
               const v = lastVal.afr
               return v >= 14.4 && v <= 15.0 ? C.bat : v > 16 || v < 12 ? C.red : '#e07b00'
             })()}
-            delay={0.18}
+            historyPanel={
+              <HistoryPanel
+                timestamps={hist.timestamps}
+                columns={[
+                  {
+                    label: 'AFR',
+                    values: hist.afr,
+                    color: C.afr,
+                    format: v => v.toFixed(2),
+                    unit: '',
+                    isAlert: v => v > 16 || v < 12,
+                  },
+                  {
+                    label: 'STATUS',
+                    values: hist.afr,
+                    color: 'rgba(0,50,120,0.55)',
+                    format: v => v < 12 ? 'KAYA' : v < 13.5 ? 'RICH' : v >= 14.4 && v <= 15.0 ? 'STOICH' : v < 14.5 ? '~STOICH' : v <= 16 ? 'LEAN' : 'MISKIN',
+                    unit: '',
+                    isAlert: v => v > 16 || v < 12,
+                  },
+                ]}
+              />
+            }
           >
             <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '6px' }}>
               <LegendItem color={C.afr} label="AFR" value={lastVal?.afr.toFixed(2)} />
             </div>
             <SensorChart
               label="AFR"
-              height={160}
+              height={180}
               showRefLines={showRef}
+              timestamps={hist.timestamps}
+              yAxisConfig={{
+                min: 9, max: 20,
+                label: 'λ AFR',
+                format: v => v.toFixed(1),
+                showLiveLabel: true,
+              }}
               datasets={[
                 {
                   data: hist.afr, color: C.afr, min: 9, max: 20,
@@ -550,11 +906,13 @@ function Grafik() {
               background: s.bg, border: `1.5px solid ${s.border}`,
               borderRadius: '12px', padding: '10px 14px',
               display: 'flex', alignItems: 'flex-start', gap: '10px',
-              animation: `cardReveal 0.4s cubic-bezier(0.34,1.56,0.64,1) both`,
-              animationDelay: `${0.05 * i + 0.24}s`
+              opacity: 1, transition: 'opacity 0.3s ease'
             }}>
               <span style={{ fontSize: '16px', flexShrink: 0, marginTop: '1px' }}>{t.icon}</span>
-              <div style={{ fontSize: 'clamp(11px,1.2vw,13px)', color: 'rgba(0,40,100,0.82)', fontWeight: 700, fontStyle: 'italic', lineHeight: 1.5 }}>
+              <div style={{
+                fontSize: 'clamp(11px,1.2vw,13px)', color: 'rgba(0,40,100,0.82)',
+                fontWeight: 700, fontStyle: 'italic', lineHeight: 1.5
+              }}>
                 {t.text}
               </div>
             </div>
