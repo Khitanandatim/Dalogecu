@@ -721,7 +721,7 @@ function Grafik() {
           >
             <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '6px' }}>
               <LegendItem color={C.bat} label="BAT" value={lastVal?.bat.toFixed(2)} unit="V" />
-              <LegendItem color={C.rpm} label="RPM (ternorm.)" value={lastVal?.rpm.toLocaleString()} />
+              <LegendItem color={C.rpm} label="RPM (skala kanan)" value={lastVal?.rpm.toLocaleString()} unit=" rpm" />
             </div>
             <SensorChart
               label="BAT-RPM"
@@ -729,11 +729,11 @@ function Grafik() {
               showRefLines={showRef}
               timestamps={hist.timestamps}
               yAxisConfig={{
-                min: 10.5, max: 15.5,
-                label: 'Volt',
+               min: 10.5, max: 15.5,
+                label: 'Volt / RPM (norm)',   
                 format: v => v.toFixed(1),
                 showLiveLabel: true,
-              }}
+                }}
               datasets={[
                 {
                   data: hist.bat, color: C.bat, min: 10.5, max: 15.5,
@@ -744,8 +744,9 @@ function Grafik() {
                 },
                 {
                   data: hist.rpm.map(v => 10.5 + (v / 8500) * 5),
-                  color: C.rpm + '80', min: 10.5, max: 15.5,
-                }
+                  color: C.rpm,        // ← hapus '80', pakai warna penuh
+                  min: 10.5, max: 15.5,
+}
               ]}
             />
             <div style={{ fontSize: '10px', color: 'rgba(0,50,120,0.38)', marginTop: '5px', fontStyle: 'italic' }}>

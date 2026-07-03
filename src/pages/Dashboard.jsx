@@ -204,10 +204,10 @@ function Dashboard() {
           </div>
           {connected && (
             <>
-              <div style={{ fontSize: '10px', opacity: 0.6, marginTop: '3px', color: 'white' }}>
+              <div style={{ fontSize: '10px', opacity: 0.6, marginTop: '3px', color: 'black' }}>
                 {lastUpdate}
               </div>
-              <div style={{ fontSize: '10px', opacity: 0.4, color: 'white' }}>
+              <div style={{ fontSize: '10px', opacity: 0.4, color: 'black' }}>
                 #{updateCount} updates
               </div>
             </>
@@ -238,7 +238,7 @@ function Dashboard() {
           marginTop: '10px', padding: '10px 12px', borderRadius: '8px',
           background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)'
         }}>
-          <div style={{ fontSize: '10px', opacity: 0.45, color: 'white', letterSpacing: '1px', marginBottom: '4px' }}>
+          <div style={{ fontSize: '10px', opacity: 0.45, color: 'black', letterSpacing: '1px', marginBottom: '4px' }}>
             CKP SENSOR
           </div>
           <div style={{ fontSize: '13px', fontWeight: 700,
@@ -253,7 +253,7 @@ function Dashboard() {
           marginTop: '10px', padding: '10px 12px', borderRadius: '8px',
           background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)'
         }}>
-          <div style={{ fontSize: '10px', opacity: 0.45, color: 'white', letterSpacing: '1px', marginBottom: '4px' }}>
+          <div style={{ fontSize: '10px', opacity: 0.45, color: 'black', letterSpacing: '1px', marginBottom: '4px' }}>
             RPM LOAD
           </div>
           <div style={{ fontSize: '16px', fontWeight: 700, color: 'var(--accent-cyan, #00e5ff)',
